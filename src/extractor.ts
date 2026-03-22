@@ -9,7 +9,40 @@ const client = new OpenAI({
     apiKey: 'ollama',
 });
 
+function toNumber(value: string): number | null {
+    const cleaned = value
+        .replace(/[^0-9.,]/g, '')
+        .replace(/,/g, '');
+    const num = parseFloat(cleaned);
+    return Number.isFinite(num) ? num : null;
+}
 
+function extractAmountByLabel(text: string): number | null {
+    const patterns = [
+        /ยอดเงิน\s*สุทธิ\s*[:：\-]?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?)/u,
+        /รวมเงิน\s*ทั้งสิ้น\s*[:：\-]?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?)/u,
+        /Grand\s*Total\s*[:：\-]?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?)/i,
+        /Total\s*Amount\s*Due\s*[:：\-]?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?)/i,
+    ];
+
+    for (const p of patterns) {
+        const m = p.exec(text);
+        if (m && m[1]) {
+            const candidate = toNumber(m[1]);
+            if (candidate !== null) return candidate;
+        }
+    }
+
+    const numericMatches = [...text.matchAll(/([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2}))/g)];
+    for (let i = numericMatches.length - 1; i >= 0; i--) {
+        const candidate = toNumber(numericMatches[i][1]);
+        if (candidate !== null && candidate > 0) {
+            return candidate;
+        }
+    }
+
+    return null;
+}
 
 export interface ExtractedData {
     filePath: string;
@@ -18,6 +51,12 @@ export interface ExtractedData {
 }
 
 async function parseAmount(text: string): Promise<number | null> {
+    // Deterministic label-based extraction first (makes ${"W395-21-27731.pdf"}-style values more reliable)
+    const deterministic = extractAmountByLabel(text);
+    if (deterministic !== null) {
+        return deterministic;
+    }
+
     try {
         const response = await client.chat.completions.create({
             model: 'scb10x/typhoon2.1-gemma3-4b',
@@ -27,7 +66,7 @@ async function parseAmount(text: string): Promise<number | null> {
                     content: `Extract the final grand total paid from the Thai receipt.
 CRITICAL RULES:
 1. If there is a Thai text spelling of the amount (e.g. "( หนึ่งพันสามร้อยห้าสิบสี่บาทเก้าสิบสองสตางค์ )"), you MUST translate it into digits and output that. This is the ULTIMATE source of truth.
-2. Ignore anomalous large numbers like "51,354.92" — this is a PDF extraction error merging "Item 5" and "1,354.92".
+2. Avoid trusting standalone values with likely OCR artifact structure (e.g. numbers that appear to concatenate items). Prefer explicitly labeled final totals over loose candidate values.
 3. If there is no Thai text, look for "ยอดเงินสุทธิ" or "รวมเงินทั้งสิ้น".
 4. Output ONLY the final numeric value (e.g. "1354.92"). No other text, no commas. If none found, output "null".`
                 },
